@@ -11,9 +11,28 @@ import matplotlib.pyplot as plt
 import requests
 from datetime import datetime
 import json
+import os
 
+def fetch_devices(api_url=None):
+    """
+    Fetch device list from API.
+    
+    Args:
+        api_url: URL to fetch device list from
+        
+    Returns:
+        List of device dictionaries
+    """
+    api_url = api_url if api_url else (os.getenv('API_URL')+"/devices") if os.getenv('API_URL') else None
+    headers = {'Content-Type': 'application/json'}
+    api_key = os.getenv('API_KEY').strip() if os.getenv('API_KEY') else None
+    if api_key:
+        headers['Authorization'] = f"Bearer {api_key}"
+    response = requests.get(api_url, headers=headers)
+    response.raise_for_status()
+    return response.json()
 
-def fetch_data(api_url=None):
+def fetch_data(api_url=None, device_ids=None):
     """
     Fetch data from API or use sample data if no URL provided.
     
@@ -23,35 +42,24 @@ def fetch_data(api_url=None):
     Returns:
         List of dictionaries with timestamp, user_id, and connection_state
     """
+    api_url = api_url or (os.getenv('API_URL')+"/devices/metrics") if os.getenv('API_URL') else None
+    device_ids = device_ids if device_ids else []
     if api_url:
-        response = requests.get(api_url)
+        payload = {"interval": 
+                        {"startTime": 1768931759, "endTime": 1768931760},
+                    "ids": device_ids,
+                    "metrics": ["ue_connection_state"]}
+        print(os.getenv('API_KEY'))
+        headers = {'Content-Type': 'application/json'}
+        api_key = os.getenv('API_KEY').strip() if os.getenv('API_KEY') else None
+        if api_key:
+            headers['Authorization'] = f"Bearer {api_key}"
+        response = requests.post(api_url, headers=headers, json=payload)
         response.raise_for_status()
         return response.json()
     else:
-        # Sample data for demonstration
-        sample_data = [
-            {"timestamp": "2026-01-18 08:00:00", "user_id": "user1", "connection_state": 0},
-            {"timestamp": "2026-01-18 09:00:00", "user_id": "user1", "connection_state": 0},
-            {"timestamp": "2026-01-18 12:00:00", "user_id": "user1", "connection_state": 2},
-            {"timestamp": "2026-01-18 17:00:00", "user_id": "user1", "connection_state": 1},
-            {"timestamp": "2026-01-18 08:00:00", "user_id": "user2", "connection_state": 0},
-            {"timestamp": "2026-01-18 09:00:00", "user_id": "user2", "connection_state": 0},
-            {"timestamp": "2026-01-18 12:00:00", "user_id": "user2", "connection_state": 0},
-            {"timestamp": "2026-01-18 17:00:00", "user_id": "user2", "connection_state": 1},
-            {"timestamp": "2026-01-19 08:00:00", "user_id": "user1", "connection_state": 0},
-            {"timestamp": "2026-01-19 09:00:00", "user_id": "user1", "connection_state": 0},
-            {"timestamp": "2026-01-19 12:00:00", "user_id": "user1", "connection_state": 2},
-            {"timestamp": "2026-01-19 17:00:00", "user_id": "user1", "connection_state": 1},
-            {"timestamp": "2026-01-19 08:00:00", "user_id": "user2", "connection_state": 0},
-            {"timestamp": "2026-01-19 09:00:00", "user_id": "user2", "connection_state": 0},
-            {"timestamp": "2026-01-19 12:00:00", "user_id": "user2", "connection_state": 0},
-            {"timestamp": "2026-01-19 17:00:00", "user_id": "user2", "connection_state": 1},
-            {"timestamp": "2026-01-20 08:00:00", "user_id": "user3", "connection_state": 0},
-            {"timestamp": "2026-01-20 09:00:00", "user_id": "user3", "connection_state": 0},
-            {"timestamp": "2026-01-20 12:00:00", "user_id": "user3", "connection_state": 2},
-            {"timestamp": "2026-01-20 17:00:00", "user_id": "user3", "connection_state": 1},
-        ]
-        return sample_data
+        
+        return AssertionError("No API URL provided and no sample data available.")
 
 
 def load_and_process_data(data):
@@ -64,17 +72,21 @@ def load_and_process_data(data):
     Returns:
         DataFrame with processed data including hour and day_of_week
     """
-    df = pd.DataFrame(data)
-    
-    # Parse timestamps
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    
-    # Extract hour and day of week
-    df['hour'] = df['timestamp'].dt.hour
-    df['day_of_week'] = df['timestamp'].dt.dayofweek  # Monday=0, Sunday=6
-    
-    return df
+    dataframes = []
+    for device in data:
+        datapoints = device.get('dataPoints', [])
+        df = pd.DataFrame([{
+            'timestamp': datetime.fromtimestamp(point[0]),
+            'user_id': device['id'],
+            'connection_state': point[1]
+        } for point in datapoints])
 
+        df['hour'] = df['timestamp'].dt.hour
+        df['day_of_week'] = df['timestamp'].dt.dayofweek
+        df['date'] = df['timestamp'].dt.date
+        dataframes.append(df)
+
+    return pd.concat(dataframes, ignore_index=True)
 
 def compute_probabilities(df):
     """
@@ -89,7 +101,7 @@ def compute_probabilities(df):
     probabilities = {}
     
     # Group by user and hour
-    for (user, hour), group in df.groupby(['user_id', 'hour']):
+    for (user, hour, week_day), group in df.groupby(['user_id', 'hour', 'day_of_week']):
         state_counts = group['connection_state'].value_counts()
         total_counts = len(group)
         
@@ -182,26 +194,31 @@ def main():
     """Main function to run the network connection state analysis."""
     print("Network Connection State Analyzer")
     print("=" * 50)
-    
+    devices = fetch_devices()['data']
+    device_ids = []
+    for device in devices:
+        device_ids.append(device['id'])
     # Fetch data (using sample data by default)
     print("\n1. Fetching data...")
-    data = fetch_data()
-    print(f"   Fetched {len(data)} records")
-    
+    data = fetch_data(device_ids=device_ids)['data'][0]['metricData']  #only ue_connection_state metric is fetched
+    print(f"Fetched {len(data)} records")
     # Load and process data
     print("\n2. Processing data...")
-    df = load_and_process_data(data)
-    print(f"   Processed data shape: {df.shape}")
-    print(f"   Date range: {df['timestamp'].min()} to {df['timestamp'].max()}")
+    dataframes = load_and_process_data(data)
+    with open('data.csv', 'w') as f:
+        dataframes.to_csv(f)
+        
+    print(f"   Processed data shape: {dataframes.shape}")
+    print(f"   Date range: {dataframes['timestamp'].min()} to {dataframes['timestamp'].max()}")
     
     # Compute probabilities
-    print("\n3. Computing probabilities P(state|user,hour)...")
-    probabilities = compute_probabilities(df)
-    print(f"   Computed probabilities for {len(probabilities)} (user, hour) combinations")
+    print("\n3. Computing probabilities P(state|user,hour,day_of_week)...")
+    probabilities = compute_probabilities(dataframes)
+    print(f"   Computed probabilities for {len(probabilities)} (user, hour, day_of_week) combinations")
     
     # Make some predictions
     print("\n4. Sample predictions:")
-    for user in df['user_id'].unique()[:3]:
+    for user in dataframes['user_id'].unique()[:3]:
         for hour in [8, 12, 17]:
             state, prob = predict_state(probabilities, user, hour)
             if state is not None:
@@ -210,7 +227,7 @@ def main():
     
     # Plot heatmaps
     print("\n5. Generating heatmaps...")
-    plot_heatmaps(df, probabilities)
+    plot_heatmaps(dataframes, probabilities)
     
     print("\n" + "=" * 50)
     print("Analysis complete!")
