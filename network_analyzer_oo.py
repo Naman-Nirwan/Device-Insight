@@ -6,7 +6,9 @@ import json
 import os
 from enum import Enum
 from typing import List, Dict, Tuple, Optional, Type
-
+from collections import defaultdict
+import numpy as np
+from scipy.spatial.distance import cosine
 
 """Enum for connection states."""
 class ConnectionState(Enum):
@@ -429,6 +431,96 @@ class NetworkAnalyzer:
         accuracy = correct_predictions / total_predictions if total_predictions > 0 else 0.0
         return accuracy
 
+class Classifier:
+    def __init__(self):
+        self._features={} #private attribute to store features
+        self.classifications = {}
+
+    @staticmethod
+    def entropy(p):
+        p = p + 1e-9
+        return -np.sum(p * np.log(p))
+    
+    @staticmethod
+    def build_user_tensor(prob_dict):
+        """
+        Returns:
+        user_profiles[user] = array shape (7,96,3)
+        """
+        user_profiles = defaultdict(lambda: np.zeros((7,96,3)))
+
+        for (user, block, day), probs in prob_dict.items():
+            user_profiles[user][day, block, :] = [probs.get(1,0), probs.get(0,0), probs.get(2,0)]
+
+        return user_profiles
+    
+    def extract_weekly_features(self,user,profile):
+        """
+        profile shape: (7,96,3)
+        """
+        feats = {}
+        login = profile[:,:,0]   # p_logged_in
+        idle  = profile[:,:,2]
+
+        total_login_activity = np.sum(login)
+        feats["total_login_activity"] = total_login_activity
+
+        # If device never logs in, stop here
+        if total_login_activity < 1e-3:
+            feats["inactive"] = True
+            self._features[user] = feats
+            return feats
+
+        feats["inactive"] = False
+        # --- Temporal entropy per day ---
+        day_entropies = [self.entropy(login[d]) for d in range(7)]
+
+        feats["login_entropy_mean"] = np.mean(day_entropies)
+        feats["login_entropy_var"]  = np.var(day_entropies)
+
+        # --- Weekday consistency ---
+        sims = []
+        for d1 in range(7):
+            for d2 in range(d1+1, 7):
+                sims.append(1 - cosine(login[d1], login[d2]))
+
+        feats["weekday_similarity"] = np.mean(sims)
+
+        # --- Peak strength ---
+        feats["login_peak_max"] = np.max(login)
+
+        # --- Active days count ---
+        feats["active_days"] = np.sum(np.max(login, axis=1) > 0.05)
+
+        # --- Idle dominance ---
+        feats["idle_mean"] = np.mean(idle)
+
+        self._features[user] = feats
+
+        return feats
+
+    def classify(self, probabilities: Dict[Tuple, Dict[int, float]]) -> None:
+        """
+        On the basis of the past data and probabilities classify the users into different categories:
+            1. Fixed Wireless Devices
+            2. Shift Connected Devices
+            3. Ad-hoc Connected Devices (Random Connections)
+        """
+
+        user_profiles = self.build_user_tensor(probabilities)
+        for user, profile in user_profiles.items():
+            feats = self.extract_weekly_features(user, profile)
+            if not feats["inactive"] and feats["weekday_similarity"] > 0.85 and feats["login_entropy_mean"] < 2.5:
+                classification = "Fixed Wireless Device"
+            elif not feats["inactive"] and feats["weekday_similarity"] > 0.6 and feats["active_days"] >= 4:
+                classification = "Shift Connected Device"
+            else:
+                classification = "Ad-hoc Connected Device"
+            
+            self.classifications[user] = classification
+        
+        
+        
 
 def main():
     """Main entry point."""
@@ -449,7 +541,8 @@ def main():
     probability = analyzer.initial_train(train_start_time, train_end_time)
     val_accuracy = analyzer.evaluate(val_dataframe)
     print(f"\nValidation Accuracy: {val_accuracy:.2%}")
-    
+
+
 
 if __name__ == "__main__":
     main()
