@@ -155,7 +155,7 @@ class DataProcessor:
 class ProbabilityAnalyzer:
     """Analyzes connection state probabilities."""
     
-    def __init__(self, df: pd.DataFrame, period: int = 60):
+    def __init__(self, df: pd.DataFrame, period: int = 60, half_life: Optional[int] = None):
         """
         Initialize analyzer with data.
         
@@ -165,6 +165,7 @@ class ProbabilityAnalyzer:
         self.df = df
         self.period = period # in minutes
         self.probabilities, self.counts = {}, {}
+        self.half_life = half_life # half-life for exponential decay
     
     def _compute_probabilities(self) -> Dict[Tuple, Dict[int, float]]:
         """
@@ -175,18 +176,65 @@ class ProbabilityAnalyzer:
         """
         probabilities = {}
         counts = {}
+        # now = pd.Timestamp.now()
+        now = pd.Timestamp(2026, 1, 30) # fixed current time for reproducibility
+
+        if self.half_life:
+            age_days = (now - self.df['timestamp']).dt.total_seconds() / (24 * 3600)
+            self.df['weight'] = np.exp(-np.log(2) * age_days / self.half_life)
+        else:
+            self.df['weight'] = 1.0
+
+        weighted_counts = (
+            self.df
+            .groupby(['user_id', 'period', 'day_of_week', 'connection_state'])['weight']
+            .sum()
+            .reset_index()
+        )
+
+        total_counts = (
+            weighted_counts
+            .groupby(['user_id', 'period', 'day_of_week'])['weight']
+            .sum()
+            .reset_index()
+            .rename(columns={'weight': 'total_weight'})
+        )
+
+        prob_df = weighted_counts.merge(
+            total_counts,
+            on=['user_id', 'period', 'day_of_week'],
+            how='left'
+        )
+
+        prob_df['probability'] = prob_df['weight'] / prob_df['total_weight']
         
+        for (user, period, day), group in prob_df.groupby(
+            ['user_id', 'period', 'day_of_week']
+        ):
+            probabilities[(user, period, day)] = (
+                group
+                .set_index('connection_state')['probability']
+                .to_dict()
+            )
+            counts[(user, period, day)] = (
+                group
+                .set_index('connection_state')['weight']
+                .to_dict()
+            )
+
+
+
         # Group by user and hour
-        for (user, period, week_day), group in self.df.groupby(['user_id', 'period', 'day_of_week']):
-            state_counts = group['connection_state'].value_counts()
-            total_counts = len(group)
-            # Calculate probability for each state
-            state_probs = {}
-            for state in [ConnectionState.LOGGED_IN.value, ConnectionState.LOGGED_OUT.value, ConnectionState.IDLE.value]:
-                state_probs[state] = state_counts.get(state, 0) / total_counts
+        # for (user, period, week_day), group in self.df.groupby(['user_id', 'period', 'day_of_week']):
+        #     state_counts = group.groupby('connection_state')['weight'].sum()
+        #     total_counts = state_counts.sum()
+        #     # Calculate probability for each state
+        #     state_probs = {}
+        #     for state in [ConnectionState.LOGGED_IN.value, ConnectionState.LOGGED_OUT.value, ConnectionState.IDLE.value]:
+        #         state_probs[state] = state_counts.get(state, 0) / total_counts
             
-            probabilities[(user, period, week_day)] = state_probs
-            counts[(user, period, week_day)] = state_counts.to_dict()
+        #     probabilities[(user, period, week_day)] = state_probs
+        #     counts[(user, period, week_day)] = state_counts.to_dict()
             
         return probabilities, counts
     
@@ -206,23 +254,24 @@ class ProbabilityAnalyzer:
         minute = dt.minute
         day_of_week = dt.weekday()
         period = (hour * 60 + minute) // self.period
-        key = (user_id, period, day_of_week) 
-        
-        if key not in self.probabilities:
+
+        key = (user_id, period, day_of_week)
+        state_probs = self.probabilities.get(key, {})
+
+        if not any(state_probs.values()):
             return None, 0.0
         
-        state_probs = self.probabilities[key]
         most_likely_state = max(state_probs, key=state_probs.get)
         
         return most_likely_state, state_probs[most_likely_state]
     
-    def update_probabilities(self, df: pd.DataFrame) -> None:
+    def update_probabilities(self, df: pd.DataFrame, new:bool=False) -> None:
         """Update probabilities with new data."""
         self.df = df
         probabilities, counts = self._compute_probabilities()
         for key, state_probs in probabilities.items():
             
-            if key in self.probabilities:
+            if key in self.probabilities and not new:
                 # Weighted average based on counts
                 existing_count = sum(self.counts[key].values())
                 new_count = sum(counts[key].values())
@@ -308,7 +357,7 @@ class Visualizer:
 class NetworkAnalyzer:
     """Main orchestrator for network connection state analysis."""
     
-    def __init__(self, api_url: Optional[str] = None, api_key: Optional[str] = None, period: int = 60):
+    def __init__(self, api_url: Optional[str] = None, api_key: Optional[str] = None, period: int = 60, half_life: Optional[int] = None):
         """
         Initialize the analyzer.
         
@@ -322,6 +371,7 @@ class NetworkAnalyzer:
         self.visualizer = None
         self.processor = None
         self.period = period  # in minutes
+        self.half_life = half_life  # half-life for exponential decay
 
     def initial_train(self, start_time:int=None, end_time:int=None, resolution:int=600) -> Dict[Tuple, Dict[int, float]]:
         """
@@ -356,12 +406,12 @@ class NetworkAnalyzer:
         print(f"   Date range: {self.data['timestamp'].min()} to {self.data['timestamp'].max()}")
 
         print("\n4. Computing probabilities P(state|user,period,weekday)...")
-        self.analyzer = ProbabilityAnalyzer(self.data,period=self.period)
+        self.analyzer = ProbabilityAnalyzer(self.data,period=self.period, half_life=self.half_life)
         self.analyzer.probabilities, self.analyzer.counts = self.analyzer._compute_probabilities()
         self.save_probabilities()
         return self.analyzer.probabilities
     
-    def update(self, start_time: int = None, end_time: int = None, resolution: int = 600)-> None:
+    def update(self, start_time: int = None, end_time: int = None, resolution: int = 600, new: bool = True)-> None:
         """
         Update the model with new data.
 
@@ -385,7 +435,7 @@ class NetworkAnalyzer:
         print(f"   Fetched {len(raw_data)} records")
         self.data = self.processor.process_raw_data(raw_data)
 
-        self.analyzer.update_probabilities(self.data)
+        self.analyzer.update_probabilities(self.data, new=new)
         self.save_probabilities()
 
     def predict_user_state(self, user_id: str, timestamp: int) -> Tuple[Optional[str], float]:
@@ -447,7 +497,7 @@ class NetworkAnalyzer:
         while current_start < end_time:
             current_end = min(current_start + interval_seconds, end_time)
             print(f"\nTraining from {datetime.fromtimestamp(current_start)} to {datetime.fromtimestamp(current_end)}")
-            self.update(current_start, current_end, resolution=resolution)
+            self.update(current_start, current_end, resolution=resolution, new=False)
             current_start = current_end
 
     def save_probabilities(self, prob_path: str = 'probabilities.json', count_path: str = 'counts.json') -> None:
