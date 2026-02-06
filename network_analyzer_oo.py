@@ -57,7 +57,7 @@ class APIClient:
         return response.json()['data']
     
     def fetch_metrics(self, device_ids: List[str], 
-                     start_time: int, end_time: int) -> Dict:
+                     start_time: int, end_time: int, resolution: int) -> Dict:
         """
         Fetch metrics data from API.
         
@@ -82,7 +82,7 @@ class APIClient:
             },
             "ids": device_ids,
             "metrics": ["ue_connection_state"],
-            "resolution": 600
+            "resolution": resolution
         }
         
         response = requests.post(url, headers=self._get_headers(), json=payload)
@@ -137,12 +137,12 @@ class DataProcessor:
         
         return pd.concat(dataframes, ignore_index=True)
     
-    def data_from_api(self, api_url:str=None, api_key:str=None, start_time:int=None, end_time:int=None) -> pd.DataFrame:
+    def data_from_api(self, api_url:str=None, api_key:str=None, start_time:int=None, end_time:int=None, resolution:int=600) -> pd.DataFrame:
         """Fetch and process data from API."""
         self.api_client = APIClient(api_url, api_key)
         devices = self.api_client.fetch_devices()
         device_ids = [device['id'] for device in devices]
-        metrics_response = self.api_client.fetch_metrics(device_ids, start_time, end_time)
+        metrics_response = self.api_client.fetch_metrics(device_ids, start_time, end_time,resolution=resolution)
         raw_data = metrics_response['metricData']
         return self.process_raw_data(raw_data)
     
@@ -164,7 +164,7 @@ class ProbabilityAnalyzer:
         """
         self.df = df
         self.period = period # in minutes
-        self.probabilities, self.counts = self._compute_probabilities()
+        self.probabilities, self.counts = {}, {}
     
     def _compute_probabilities(self) -> Dict[Tuple, Dict[int, float]]:
         """
@@ -187,7 +187,7 @@ class ProbabilityAnalyzer:
             
             probabilities[(user, period, week_day)] = state_probs
             counts[(user, period, week_day)] = state_counts.to_dict()
-        
+            
         return probabilities, counts
     
     def predict_state(self, user_id: str, timestamp: int) -> Tuple[Optional[int], float]:
@@ -219,22 +219,21 @@ class ProbabilityAnalyzer:
     def update_probabilities(self, df: pd.DataFrame) -> None:
         """Update probabilities with new data."""
         self.df = df
-        problabilities, counts = self._compute_probabilities()
-        for key, state_probs in problabilities.items():
-            for state, prob in state_probs.items():
-                if key in self.probabilities:
-                    # Weighted average based on counts
-                    existing_count = sum(self.counts[key].values())
-                    new_count = sum(counts[key].values())
-                    total_count = existing_count + new_count
-                    existing_prob = self.probabilities[key].get(state, 0)
-                    new_prob = prob
-                    updated_prob = (existing_prob * existing_count + new_prob * new_count) / total_count
+        probabilities, counts = self._compute_probabilities()
+        for key, state_probs in probabilities.items():
+            
+            if key in self.probabilities:
+                # Weighted average based on counts
+                existing_count = sum(self.counts[key].values())
+                new_count = sum(counts[key].values())
+                total_count = existing_count + new_count
+                for state, prob in state_probs.items():
+                    updated_prob = (self.counts[key].get(state, 0) + counts[key].get(state, 0)) / total_count
                     self.probabilities[key][state] = updated_prob
-                    self.counts[key][state] = existing_count + new_count
-                else:
-                    self.probabilities[key] = state_probs
-                    self.counts[key] = counts[key]
+                    self.counts[key][state] = self.counts[key].get(state, 0) + counts[key].get(state, 0)
+            else:
+                self.probabilities[key] = state_probs
+                self.counts[key] = counts[key]
 
     def get_probabilities(self) -> Dict[Tuple, Dict[int, float]]:
         """Get all computed probabilities."""
@@ -324,7 +323,7 @@ class NetworkAnalyzer:
         self.processor = None
         self.period = period  # in minutes
 
-    def initial_train(self, start_time:int=None, end_time:int=None) -> Dict[Tuple, Dict[int, float]]:
+    def initial_train(self, start_time:int=None, end_time:int=None, resolution:int=600) -> Dict[Tuple, Dict[int, float]]:
         """
         Initially train the probability model.
 
@@ -347,7 +346,7 @@ class NetworkAnalyzer:
 
         # Fetch metrics
         print("\n1. Fetching metrics...")
-        metrics_response = self.api_client.fetch_metrics(device_ids, start_time, end_time)
+        metrics_response = self.api_client.fetch_metrics(device_ids, start_time, end_time,resolution=resolution)
         raw_data = metrics_response['metricData']
         print(f"   Fetched {len(raw_data)} records")
         self.processor = DataProcessor(period=self.period)
@@ -358,11 +357,11 @@ class NetworkAnalyzer:
 
         print("\n4. Computing probabilities P(state|user,period,weekday)...")
         self.analyzer = ProbabilityAnalyzer(self.data,period=self.period)
-        probabilities = self.analyzer.get_probabilities()
-        print(f"   Computed probabilities for {len(probabilities)} (user, hour) combinations")
-        return probabilities
+        self.analyzer.probabilities, self.analyzer.counts = self.analyzer._compute_probabilities()
+        self.save_probabilities()
+        return self.analyzer.probabilities
     
-    def update(self, start_time: int = None, end_time: int = None)-> None:
+    def update(self, start_time: int = None, end_time: int = None, resolution: int = 600)-> None:
         """
         Update the model with new data.
 
@@ -381,12 +380,13 @@ class NetworkAnalyzer:
 
         # Fetch metrics
         print("\n1. Fetching metrics...")
-        metrics_response = self.api_client.fetch_metrics(device_ids, start_time, end_time)
+        metrics_response = self.api_client.fetch_metrics(device_ids, start_time, end_time,resolution=resolution)
         raw_data = metrics_response['metricData']
         print(f"   Fetched {len(raw_data)} records")
         self.data = self.processor.process_raw_data(raw_data)
 
         self.analyzer.update_probabilities(self.data)
+        self.save_probabilities()
 
     def predict_user_state(self, user_id: str, timestamp: int) -> Tuple[Optional[str], float]:
         """
@@ -424,13 +424,64 @@ class NetworkAnalyzer:
         
         for _, row in test_data.iterrows():
             predicted_state, _ = self.analyzer.predict_state(row['user_id'], int(row['timestamp'].timestamp()))
-            if predicted_state == row['connection_state']:
+            if predicted_state and (int(predicted_state) == int(row['connection_state'])):
                 correct_predictions += 1
             total_predictions += 1
-        
         accuracy = correct_predictions / total_predictions if total_predictions > 0 else 0.0
         return accuracy
 
+    def train_recursive(self, start_time:int, end_time:int, interval_days:int=5, resolution:int=600) -> None:
+        """
+        Train the model recursively over intervals.
+
+        Args:
+            start_time: Start timestamp for data fetching
+            end_time: End timestamp for data fetching
+            interval_days: Number of days per training interval
+        """
+        current_start = start_time
+        interval_seconds = interval_days * 24 * 3600
+        current_end = current_start + interval_seconds
+        self.initial_train(current_start, min(current_end, end_time), resolution=resolution)
+        current_start = current_end
+        while current_start < end_time:
+            current_end = min(current_start + interval_seconds, end_time)
+            print(f"\nTraining from {datetime.fromtimestamp(current_start)} to {datetime.fromtimestamp(current_end)}")
+            self.update(current_start, current_end, resolution=resolution)
+            current_start = current_end
+
+    def save_probabilities(self, prob_path: str = 'probabilities.json', count_path: str = 'counts.json') -> None:
+        """Save computed probabilities to a JSON file."""
+        if self.analyzer is None:
+            raise RuntimeError("Analysis not run yet. Train first.")
+        
+        probabilities = self.analyzer.probabilities
+        counts = self.analyzer.counts
+        with open(prob_path,'w') as f:
+            json.dump({str(k): v for k, v in probabilities.items()}, f, indent=4)
+        with open(count_path,'w') as f:
+            json.dump({str(k): v for k, v in counts.items()}, f, indent=4)
+        print(f"Probabilities saved to '{prob_path}' and counts saved to '{count_path}'")
+
+    def load_probabilities(self, prob_path: str = 'probabilities.json', count_path: str = 'counts.json') -> None:
+        """Load probabilities from a JSON file."""
+        if not os.path.exists(prob_path):
+            raise FileNotFoundError(f"File '{prob_path}' not found.")
+        
+        with open(prob_path, 'r') as f:
+            prob_data = json.load(f)
+        with open(count_path, 'r') as f:
+            count_data = json.load(f)
+
+        probabilities = {tuple(eval(k)): v for k, v in prob_data.items()}
+        counts = {tuple(eval(k)): v for k, v in count_data.items()}
+        
+        self.analyzer = ProbabilityAnalyzer(pd.DataFrame(), period=self.period)
+        self.analyzer.probabilities = probabilities
+        self.analyzer.counts = counts
+
+        return
+    
 class Classifier:
     def __init__(self):
         self._features={} #private attribute to store features
