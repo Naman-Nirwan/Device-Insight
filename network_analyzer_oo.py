@@ -80,7 +80,7 @@ class APIClient:
                 "startTime": start_time,
                 "endTime": end_time
             },
-            "ids": device_ids,
+            "ids": device_ids[:50],
             "metrics": ["ue_connection_state"],
             "resolution": resolution
         }
@@ -238,7 +238,7 @@ class ProbabilityAnalyzer:
             
         return probabilities, counts
     
-    def predict_state(self, user_id: str, timestamp: int) -> Tuple[Optional[int], float]:
+    def predict_state(self, user_id: str, timestamp) -> Tuple[Optional[int], float]:
         """
         Predict the most likely connection state for a user at a given hour.
         
@@ -249,7 +249,7 @@ class ProbabilityAnalyzer:
         Returns:
             Tuple of (most_likely_state, probability) or (None, 0.0) if not found
         """
-        dt = datetime.fromtimestamp(timestamp)
+        dt = timestamp
         hour = dt.hour
         minute = dt.minute
         day_of_week = dt.weekday()
@@ -259,6 +259,7 @@ class ProbabilityAnalyzer:
         state_probs = self.probabilities.get(key, {})
 
         if not any(state_probs.values()):
+            print(key)
             return None, 0.0
         
         most_likely_state = max(state_probs, key=state_probs.get)
@@ -276,7 +277,7 @@ class ProbabilityAnalyzer:
                 existing_count = sum(self.counts[key].values())
                 new_count = sum(counts[key].values())
                 total_count = existing_count + new_count
-                for state, prob in state_probs.items():
+                for state in [ConnectionState.LOGGED_IN.value, ConnectionState.LOGGED_OUT.value, ConnectionState.IDLE.value]:
                     updated_prob = (self.counts[key].get(state, 0) + counts[key].get(state, 0)) / total_count
                     self.probabilities[key][state] = updated_prob
                     self.counts[key][state] = self.counts[key].get(state, 0) + counts[key].get(state, 0)
@@ -473,8 +474,8 @@ class NetworkAnalyzer:
         total_predictions = 0
         
         for _, row in test_data.iterrows():
-            predicted_state, _ = self.analyzer.predict_state(row['user_id'], int(row['timestamp'].timestamp()))
-            if predicted_state and (int(predicted_state) == int(row['connection_state'])):
+            predicted_state, _ = self.analyzer.predict_state(row['user_id'], row['timestamp'])
+            if predicted_state!=None and (predicted_state == row['connection_state']):
                 correct_predictions += 1
             total_predictions += 1
         accuracy = correct_predictions / total_predictions if total_predictions > 0 else 0.0
